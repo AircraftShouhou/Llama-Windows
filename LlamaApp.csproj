@@ -10,9 +10,31 @@
         <EnableMsixTooling>true</EnableMsixTooling>
         <WindowsPackageType>MSIX</WindowsPackageType>
 
+        <!-- Self-contained Windows App SDK: the runtime DLLs are bundled with
+             the app. WindowsAppSDK 2.x no longer resolves an OS-registered
+             runtime for UNPACKAGED processes without a machine-level runtime
+             install (the 2.5.1 auto-initializer dies with REGDB_E_CLASSNOTREG
+             before any app code runs), and this is how the app has always been
+             run from bin/ ("dotnet run", double-clicking the exe). Bundling
+             also removes the end-user runtime dependency from the shipped
+             MSIX — installs no longer require the Windows App Runtime
+             framework packages. -->
+        <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+
         <!-- Project Options -->
         <Nullable>enable</Nullable>
         <LangVersion>latest</LangVersion>
+
+        <!-- WinAppSDK 2.3.1+ XAML performance opt-ins (compiled into the
+             generated entry point via XamlOptionalChanges.EnableChange). These
+             two are behaviorally neutral: FontIcon/BitmapIcon drop a decorative
+             Grid from their visual tree (this app resolves rows by walking the
+             tree for DataContext, which is unaffected), and Style setters with
+             no value stop loading. DefaultStyleOptimizations swaps in the
+             optimized control templates (notably ScrollBar); enabled after a
+             runtime pass over the flyout, Settings and the overlay confirmed
+             everything renders and scrolls. -->
+        <EnabledXamlOptionalChanges>IconNoGridOptimization,OptimizeApplyStyles,DefaultStyleOptimizations</EnabledXamlOptionalChanges>
         <ImplicitUsings>enable</ImplicitUsings>
         <RootNamespace>LlamaApp</RootNamespace>
 
@@ -61,13 +83,9 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <!-- All image assets — package logos at every scale (Start tile,
-             taskbar, installer dialog, Add/Remove Programs, splash), the tray
-             icon, and the per-row brand logos — ship as Content so the
-             single-project MSIX packs them and they land next to the exe for
-             AppContext.BaseDirectory lookups (see TrayIconManager). A glob, so
-             a newly added asset can't be forgotten from the package. -->
-        <Content Include="Assets\**" />
+        <Content Include="Assets\**">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </Content>
     </ItemGroup>
 
     <ItemGroup>
@@ -78,7 +96,7 @@
         <!-- Exact pins (no floating major ranges): a restore must never
              silently pick up a newly published or hijacked minor/patch. Bump
              these deliberately, as a reviewed change. -->
-        <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260921001"/>
+        <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
         <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4258.31"/>
         <PackageReference Include="H.NotifyIcon" Version="2.4.1"/>
         <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2705"/>
