@@ -47,6 +47,12 @@ public sealed partial class OverlayWindow : Window
     private const int GWL_STYLE = -16;
     private const long WS_POPUP = 0x80000000L;
 
+    // UI thread queue — the shared-prompt retry needs to come back here
+    // (WebView2 calls must stay on the UI thread).
+    private readonly Microsoft.UI.Dispatching.DispatcherQueue _dispatcher =
+        Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread()
+        ?? throw new InvalidOperationException("OverlayWindow must be created on the UI thread.");
+
     private bool _configured;
     private IntPtr _hwnd;
 
@@ -59,7 +65,11 @@ public sealed partial class OverlayWindow : Window
     // after) the show sequence when Windows denies us foreground — without it
     // the overlay hides itself straight back, looking like it never opened.
     private const long ShownDeactivationGraceMs = 250;
-    private bool _suppressDeactivate;
+
+    // How long the CURRENT summon ignores deactivations (see Summon): the
+    // hotkey default is ShownDeactivationGraceMs; programmatic summons pass a
+    // longer grace to survive the dismissing share sheet's focus churn.
+    private long _hideGraceMs = ShownDeactivationGraceMs;
     private long _lastShownMs;
 
     public OverlayWindow()
@@ -107,6 +117,171 @@ public sealed partial class OverlayWindow : Window
         };
     }
 
+    // ---- Shared-payload delivery (Windows share sheet) ----
+
+    // A payload handed over by App (a Windows share) waiting for the WebUI to
+    // be able to take it. Injection retries: a share can land before any model
+    // is loaded, when the WebUI shows its model picker and there is no
+    // composer yet — the payload waits and lands once the chat screen is up.
+    // A shared image additionally waits for an image-capable model (the
+    // paste targets the attachment pipeline, which needs vision).
+    private sealed record PendingShare(string? Prompt, string? ImagePath);
+
+    private PendingShare? _pendingShare;
+    private int _shareAttempts;
+    private const int MaxShareAttempts = 40; // ~2 min at 3s
+    private bool _imageWaitNotified;
+
+    // Retry chains are generation-guarded: a second share while the first is
+    // still retrying must invalidate the first chain (otherwise both chains
+    // share one attempt counter and give up in half the intended time —
+    // observed in the logs as a give-up after ~1 minute instead of ~2).
+    private int _shareGeneration;
+
+    /// <summary>
+    /// Queues shared text for the WebUI's chat composer. Attempts injection
+    /// immediately and keeps retrying on a timer until a composer exists
+    /// (the model picker screen has none) or the attempts run out.
+    /// </summary>
+    public void SetPendingPrompt(string prompt)
+    {
+        _pendingShare = new PendingShare(prompt, null);
+        _shareAttempts = 0;
+        _imageWaitNotified = false;
+        _shareGeneration++;
+        TryInjectPendingShareAsync();
+    }
+
+    /// <summary>
+    /// Queues a shared image (.jpg/.jpeg/.png) as a synthetic paste into the
+    /// WebUI's composer — its <c>onPaste</c> handler feeds pasted files to the
+    /// attachment pipeline. The paste waits for an image-capable model to be
+    /// loaded (a text-only model's chat accepts no attachments), retrying
+    /// like a text prompt until then.
+    /// </summary>
+    public void SetPendingImage(string imagePath)
+    {
+        _pendingShare = new PendingShare(null, imagePath);
+        _shareAttempts = 0;
+        _imageWaitNotified = false;
+        _shareGeneration++;
+        TryInjectPendingShareAsync();
+    }
+
+    private async void TryInjectPendingShareAsync()
+    {
+        var pending = _pendingShare;
+        if (pending is null) return;
+
+        // Everything inside try: the CoreWebView2 getter can itself fault
+        // while initialization is in flight, and an async void has no
+        // catch-all — an escape here fail-fasts the process.
+        try
+        {
+            var core = ModelWebUi.CoreWebView2;
+            if (core is null)
+            {
+                RetryShareSoon(pending);
+                return;
+            }
+
+            if (pending.ImagePath is { } imagePath)
+            {
+                // The attachment pipeline is only wired up for image-capable
+                // models — wait (and say so, once) rather than pasting into a
+                // chat that can't take the image.
+                if (!LlamaManager.Shared.LoadedModelSupportsImages)
+                {
+                    if (!_imageWaitNotified)
+                    {
+                        _imageWaitNotified = true;
+                        Notifications.Show("Waiting for an image-capable model",
+                            "The shared image will attach once a model that supports images is loaded — pick one in the chat.");
+                    }
+                    RetryShareSoon(pending);
+                    return;
+                }
+
+                var script = OverlayPromptInjection.BuildImagePaste(
+                    Convert.ToBase64String(File.ReadAllBytes(imagePath)),
+                    Common.SharedImage.MimeTypeFor(imagePath),
+                    System.IO.Path.GetFileName(imagePath));
+                var result = await core.ExecuteScriptAsync(script);
+                if (bool.TryParse(result, out var attached) && attached)
+                {
+                    _pendingShare = null;
+                    Common.Log.Info("overlay webview: shared image pasted into the chat composer");
+                    DeleteOwnScratchImage(imagePath);
+                    return;
+                }
+            }
+            else if (pending.Prompt is { } prompt)
+            {
+                var result = await core.ExecuteScriptAsync(OverlayPromptInjection.Build(prompt));
+                // ExecuteScriptAsync returns the script's result JSON-encoded —
+                // a boolean comes back as the literal "true".
+                if (bool.TryParse(result, out var placed) && placed)
+                {
+                    _pendingShare = null;
+                    Common.Log.Info("overlay webview: shared prompt placed in the chat composer");
+                    return;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Common.Log.Debug($"overlay webview: share delivery not ready ({ex.Message})");
+        }
+        RetryShareSoon(pending);
+    }
+
+    /// <summary>Another attempt in a few seconds — the composer may not exist
+    /// yet (no model loaded), the page may still be loading, or (for images)
+    /// the loaded model may not accept images.</summary>
+    private void RetryShareSoon(PendingShare pending)
+    {
+        if (_pendingShare is null) return;
+        if (++_shareAttempts >= MaxShareAttempts)
+        {
+            Common.Log.Warn(
+                (pending.ImagePath is { } path
+                    ? $"gave up delivering the shared image '{path}'"
+                    : $"gave up placing the shared prompt ({pending.Prompt?.Length ?? 0} chars)") +
+                " — the chat never became ready for it");
+            _pendingShare = null;
+            if (pending.ImagePath is { } abandoned) DeleteOwnScratchImage(abandoned);
+            return;
+        }
+        var generation = _shareGeneration;
+        _ = Task.Delay(TimeSpan.FromSeconds(3)).ContinueWith(
+            _ =>
+            {
+                if (generation != _shareGeneration) return; // superseded by a newer share
+                _dispatcher.TryEnqueue(TryInjectPendingShareAsync);
+            });
+    }
+
+    /// <summary>
+    /// The app's scratch dir for converted Bitmap shares — the only images
+    /// Llama owns (a StorageItems share points at the user's own file, which
+    /// must not be deleted).
+    /// </summary>
+    internal static string ScratchImageDir =>
+        System.IO.Path.Combine(Common.AppData.Root, "shared");
+
+    private static void DeleteOwnScratchImage(string path)
+    {
+        try
+        {
+            if (System.IO.Path.GetFullPath(path).StartsWith(
+                    System.IO.Path.GetFullPath(ScratchImageDir) +
+                    System.IO.Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase))
+                File.Delete(path);
+        }
+        catch { /* best-effort scratch cleanup */ }
+    }
+
     /// <summary>Style as a borderless, taskbar-less spotlight popup centered on screen.</summary>
     private void ConfigureAsOverlay()
     {
@@ -141,7 +316,13 @@ public sealed partial class OverlayWindow : Window
     }
 
     /// <summary>Shows the overlay centered on the monitor nearest the cursor, ready for input.</summary>
-    public void Summon()
+    /// <param name="hideGraceMs">How long after the summon a focus loss (deactivation)
+    /// is ignored instead of hiding the overlay. The hotkey summon keeps the
+    /// default; programmatic summons (a share/Open With handoff) pass a longer
+    /// grace — the dismissing share sheet races the summon for focus and can
+    /// activate-then-deactivate the overlay repeatedly, which used to flash it
+    /// shut before the user ever saw it.</param>
+    public void Summon(long hideGraceMs = ShownDeactivationGraceMs)
     {
         // Show the window FIRST, then populate content. Mutating a batch of
         // control properties on a frameless WS_POPUP Mica window before it has
@@ -152,19 +333,99 @@ public sealed partial class OverlayWindow : Window
         Common.Log.Info("overlay summon: begin");
         CenterOnScreen();
         _lastShownMs = Environment.TickCount64;
-        _suppressDeactivate = true;
+        _hideGraceMs = hideGraceMs;
+
+        // Raise the overlay above every normal window before showing it. A
+        // programmatic summon (share/Open With handoff, tray) runs while another
+        // app holds the foreground, and Windows denies SetForegroundWindow to
+        // background processes — without this raise the freshly shown overlay
+        // stays at its old Z position, invisible behind the user's windows, and
+        // the summon looks like nothing happened. Topmost is safe here: the
+        // overlay hides itself on the next deactivation, so it never lingers
+        // above other apps.
+        const uint SWP_NOMOVE_S = 0x0002, SWP_NOSIZE_S = 0x0001, SWP_NOACTIVATE = 0x0010;
+        SetWindowPos(_hwnd, new IntPtr(-1) /* HWND_TOPMOST */, 0, 0, 0, 0,
+            SWP_NOMOVE_S | SWP_NOSIZE_S | SWP_NOACTIVATE);
 
         AppWindow.Show();
         ShowWindow(_hwnd, SW_SHOW);
-        SetForegroundWindow(_hwnd);
+        TakeForegroundInput();
         Common.Log.Info("overlay summon: window shown");
 
         // Now that the window is on screen, refresh the chrome and navigate
         // the WebView2 to the loaded model's WebUI.
         RefreshModelBadge();
         NavigateToModel();
+        FocusComposerWhenReady();
 
         Common.Log.Info("overlay summon: done");
+    }
+
+    /// <summary>
+    /// Asks Windows to make the overlay the foreground window so keystrokes
+    /// land in the chat instead of the app the user was in. A plain
+    /// <see cref="SetForegroundWindow"/> is denied while another process
+    /// holds the foreground (programmatic summons run in the background), so
+    /// borrow the foreground thread's input state via
+    /// <see cref="AttachThreadInput"/> — the documented escape hatch that
+    /// makes the raise succeed. Failures are harmless: the overlay is still
+    /// visible (topmost) and one click focuses it, same as before.
+    /// </summary>
+    private void TakeForegroundInput()
+    {
+        if (GetForegroundWindow() == _hwnd) return; // already ours (hotkey path)
+        try
+        {
+            var ourThread = GetCurrentThreadId();
+            var foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), out _);
+            if (foregroundThread != 0 && foregroundThread != ourThread)
+            {
+                AttachThreadInput(ourThread, foregroundThread, true);
+                SetForegroundWindow(_hwnd);
+                AttachThreadInput(ourThread, foregroundThread, false);
+            }
+            else
+            {
+                SetForegroundWindow(_hwnd);
+            }
+        }
+        catch (Exception ex)
+        {
+            Common.Log.Debug($"overlay: foreground request failed ({ex.Message})");
+        }
+    }
+
+    /// <summary>
+    /// Focuses the WebUI's chat composer so the user can type immediately
+    /// after the overlay opens — without this the page loads with the
+    /// composer unfocused and a mouse click is needed first. Retries for a
+    /// few seconds because the page (and its composer) may still be
+    /// navigating; gives up quietly if the WebUI never shows a composer.
+    /// </summary>
+    private async void FocusComposerWhenReady()
+    {
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            try
+            {
+                var core = ModelWebUi.CoreWebView2;
+                if (core is not null)
+                {
+                    var result = await core.ExecuteScriptAsync(
+                        OverlayPromptInjection.BuildComposerFocus());
+                    if (bool.TryParse(result, out var focused) && focused)
+                    {
+                        Common.Log.Debug("overlay webview: composer focused");
+                        return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Common.Log.Debug($"overlay webview: composer focus not ready ({ex.Message})");
+            }
+            await Task.Delay(500);
+        }
     }
 
     /// <summary>
@@ -239,6 +500,32 @@ public sealed partial class OverlayWindow : Window
     private Uri? _desiredUri;
 
     /// <summary>
+    /// Initializes the overlay's WebView2 NOW, at a calm point in app startup,
+    /// instead of lazily at the first summon. Two reasons:
+    ///
+    /// <list type="bullet">
+    /// <item>the first summon becomes instant (no init wait);</item>
+    /// <item>the first initialization is the one that occasionally trips the
+    /// x64-on-ARM64 emulation layer (an unobserved WinRT failure surfaced as
+    /// a stowed exception — 0xC000027B from the SE code in xtajit64se — which
+    /// fail-fasts the process and no handler can catch). It reproduced when a
+    /// share delivery triggered the first summon while the OS share machinery
+    /// was churning around the process. Prewarming moves that first
+    /// initialization to startup, where it is awaited in a fully-observed
+    /// context with nothing racing it; a failure here is caught, logged, and
+    /// retried at the next summon instead of killing the app.</item>
+    /// </list>
+    /// </summary>
+    public void PrewarmWebView()
+    {
+        if (ModelWebUi.CoreWebView2 is not null || _webViewInitStarted)
+            return; // already initialized (or an attempt in flight)
+
+        _webViewInitStarted = true;
+        _ = ConfigureWebViewThenNavigateAsync();
+    }
+
+    /// <summary>
     /// Initializes the WebView2's CoreWebView2, applies the navigation policy
     /// (see <see cref="Common.WebOriginPolicy"/>), then navigates to
     /// <see cref="_desiredUri"/>. Failures are logged and swallowed — a
@@ -283,6 +570,10 @@ public sealed partial class OverlayWindow : Window
             {
                 ModelWebUi.Source = _desiredUri;
                 Common.Log.Info($"overlay webview: navigating to {_desiredUri}");
+            }
+            else
+            {
+                Common.Log.Info("overlay webview: initialized (prewarm); navigation policy armed");
             }
         }
         catch (Exception ex)
@@ -373,20 +664,15 @@ public sealed partial class OverlayWindow : Window
 
     private void OverlayWindow_Activated(object sender, WindowActivatedEventArgs args)
     {
-        // Dismiss on deactivation (clicking away), the same UX as the tray flyout.
-        if (args.WindowActivationState == WindowActivationState.Deactivated)
+        // Dismiss on deactivation (clicking away), the same UX as the tray
+        // flyout — except within the summon's grace window (see Summon):
+        // focus churn around a programmatic summon (the share sheet dismissing)
+        // must not flash the overlay shut.
+        if (args.WindowActivationState == WindowActivationState.Deactivated &&
+            Environment.TickCount64 - _lastShownMs > _hideGraceMs)
         {
-            if (_suppressDeactivate ||
-                Environment.TickCount64 - _lastShownMs <= ShownDeactivationGraceMs)
-            {
-                _suppressDeactivate = false;
-                return;
-            }
+            Common.Log.Debug("overlay hidden by deactivation (focus lost)");
             Hide();
-        }
-        else
-        {
-            _suppressDeactivate = false;
         }
     }
 
@@ -459,4 +745,16 @@ public sealed partial class OverlayWindow : Window
 
     [DllImport("user32.dll")]
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
 }

@@ -71,8 +71,44 @@ namespace LlamaApp
                 Common.Log.Info("another instance is already running; redirecting activation and exiting");
                 try
                 {
-                    await instance.RedirectActivationToAsync(
-                        instance.GetActivatedEventArgs());
+                    // The running instance must learn about this launch. Its
+                    // AppInstance.Activated callback never fires on this setup
+                    // (verified), so the request travels via the handoff file +
+                    // named event instead: an "Open With" .gguf, a Windows-share
+                    // payload, or nothing at all (the plain "reopen the flyout"
+                    // second launch). A share's DataPackageView cannot cross a
+                    // process boundary, so the payload is extracted HERE — in the
+                    // process that received it — and only the distilled request
+                    // (a path, or the text) is handed off.
+                    var activatedArgs = instance.GetActivatedEventArgs();
+                    var handoff = await ExtractHandoffFromActivationAsync(activatedArgs);
+                    switch (handoff.Kind)
+                    {
+                        case Common.HandoffKind.ModelPath:
+                            Common.InstanceHandoff.WriteModel(handoff.ModelPath!);
+                            break;
+                        case Common.HandoffKind.Text:
+                            Common.InstanceHandoff.WriteText(handoff.Text!);
+                            break;
+                        case Common.HandoffKind.Image:
+                            Common.InstanceHandoff.WriteImage(handoff.ModelPath!);
+                            break;
+                    }
+                    Common.InstanceHandoff.Signal();
+
+                    // Redirect the activation to the running instance — the
+                    // documented pattern for launch/file activations — EXCEPT
+                    // for shares: RedirectActivationToAsync does not support
+                    // ShareTarget activations (the ShareOperation cannot cross
+                    // processes, which is exactly why the payload travels via
+                    // the handoff above). Redirecting a share anyway leaves the
+                    // OS share machinery with an activation it cannot deliver,
+                    // and in practice this failed fast the second process
+                    // (0xC0000409 from the native share host).
+                    var isShareActivation =
+                        activatedArgs.Data is Windows.ApplicationModel.Activation.ShareTargetActivatedEventArgs;
+                    if (!isShareActivation)
+                        await Task.Run(() => instance.RedirectActivationToAsync(activatedArgs));
                 }
                 catch (Exception ex)
                 {
@@ -85,6 +121,21 @@ namespace LlamaApp
             // The startup shortcut was renamed with the app ("LlamaApp.lnk" →
             // "Llama.lnk") — sweep any leftover from a pre-rename install.
             StartupHelper.RemoveLegacyShortcut();
+
+            // "Open With → Llama" on a .gguf and Windows shares both deliver
+            // through this instance's activation arguments (OnLaunched is the
+            // one startup hook WinUI 3 desktop has — there is no
+            // OnFileActivated/OnShareTargetActivated); an unpackaged
+            // `LlamaApp.exe <file.gguf>` launch delivers it on the command
+            // line (LaunchActivatedEventArgs.Arguments is empty for
+            // unpackaged launches — verified). Captured here, handled once
+            // startup completes below. A cold-start share is ours to report
+            // (the share sheet is waiting on this process).
+            var activationArgs = Microsoft.Windows.AppLifecycle.AppInstance.GetCurrent().GetActivatedEventArgs();
+            var startupHandoff = await ExtractHandoffFromActivationAsync(activationArgs);
+            var openModelFile = startupHandoff.Kind == Common.HandoffKind.ModelPath ? startupHandoff.ModelPath : null;
+            var sharedPrompt = startupHandoff.Kind == Common.HandoffKind.Text ? startupHandoff.Text : null;
+            openModelFile ??= FirstGgufOnCommandLine();
 
             // Create the llama-server manager singleton with the configured
             // port and listen address BEFORE anything else can touch
@@ -139,6 +190,16 @@ namespace LlamaApp
             // Add the system-tray icon with its right-click context menu.
             _trayIcon = new TrayIconManager(_window);
 
+            // Listen for a second instance's signal (Open With handoff, a
+            // Windows share, or a plain second launch): the named event fires,
+            // we consume any pending request and act on it. Replaces the
+            // AppInstance.Activated path that never fires on this setup.
+            var openWithEvent = Common.InstanceHandoff.Listen();
+            ThreadPool.RegisterWaitForSingleObject(
+                openWithEvent,
+                (_, _) => _dispatcher.TryEnqueue(HandleSecondLaunchSignal),
+                null, Timeout.Infinite, executeOnlyOnce: false);
+
             // Toast notifications for background events (model loaded, download
             // failed) while the flyout is hidden. Clicking a toast re-opens the
             // flyout; so does a redirected second-launch activation.
@@ -149,7 +210,15 @@ namespace LlamaApp
                     $"The configured listen address ({Settings.Current.ListenAddress}) isn't assigned to this machine. " +
                     $"The llama server will listen on {resolvedListen.Address} instead.");
             Notifications.Invoked += args => _dispatcher.TryEnqueue(() => HandleToastActivation(args));
-            instance.Activated += (_, _) => _dispatcher.TryEnqueue(() => _trayIcon?.ShowFlyout());
+            instance.Activated += (sender, args) => _dispatcher.TryEnqueue(() =>
+            {
+                // Belt-and-braces: when the redirect DOES deliver (MSIX on
+                // other configurations), handle the activation directly.
+                var request = FirstGgufFromFileActivation(args.Data) is { } directModel
+                    ? Common.HandoffRequest.ForModel(directModel)
+                    : Common.InstanceHandoff.TryConsume();
+                DispatchHandoff(request);
+            });
 
             // Ensure a llama.cpp server is reachable on the configured port:
             // adopt an already-running one, launch one from a found binary, or
@@ -193,6 +262,16 @@ namespace LlamaApp
             // working the moment Llama exits.
             _overlay = new OverlayWindow();
             _hotkey = new GlobalHotkey();
+            // Initialize the overlay's WebView2 NOW — at a calm point in
+            // startup, awaited and fully observed — rather than at the first
+            // summon. The app runs x64-emulated on ARM64, and the first WebView2
+            // initialization occasionally trips the emulation layer when a
+            // share delivery triggers the first summon while the OS share
+            // machinery is churning around the process (unobserved WinRT
+            // failure → stowed exception → 0xC000027B fail-fast, catchable by
+            // nothing). Prewarmed, the first summon just navigates — and is
+            // instant, too.
+            _overlay.PrewarmWebView();
             _hotkey.Register(() => _dispatcher.TryEnqueue(() => _overlay.Summon()));
 
             // The hotkey is hard-coded and otherwise undiscoverable — say so
@@ -216,6 +295,53 @@ namespace LlamaApp
             }
 
             Common.Log.Info("startup complete");
+
+            // The .gguf this instance was opened for, or the text it received
+            // as a share (see startupHandoff above) — now the tray, server
+            // pipeline and overlay all exist. A handoff left by a second
+            // instance that signalled before the listener was up is consumed
+            // here the same way.
+            var startupRequest = openModelFile is not null
+                ? Common.HandoffRequest.ForModel(openModelFile)
+                : (sharedPrompt is not null
+                    ? Common.HandoffRequest.ForText(sharedPrompt)
+                    : Common.InstanceHandoff.TryConsume());
+            DispatchHandoff(startupRequest);
+        }
+
+        /// <summary>
+        /// A second instance signalled (named event): consume whatever request
+        /// it handed off — a model file ("Open With"/share) loads, shared
+        /// text goes to the chat overlay; a plain second launch re-opens the
+        /// flyout, as it always should have.
+        /// </summary>
+        private void HandleSecondLaunchSignal()
+        {
+            DispatchHandoff(Common.InstanceHandoff.TryConsume());
+        }
+
+        /// <summary>
+        /// Acts on one handoff request: a model file loads through the
+        /// "Open With" pipeline, shared text is delivered to the chat
+        /// overlay's composer, and no request re-opens the flyout.
+        /// </summary>
+        private void DispatchHandoff(Common.HandoffRequest request)
+        {
+            switch (request.Kind)
+            {
+                case Common.HandoffKind.ModelPath:
+                    _ = OpenModelFileAsync(request.ModelPath!);
+                    break;
+                case Common.HandoffKind.Text:
+                    _ = HandleSharedPromptAsync(request.Text!);
+                    break;
+                case Common.HandoffKind.Image:
+                    _ = HandleSharedImageAsync(request.ModelPath!);
+                    break;
+                default:
+                    _trayIcon?.ShowFlyout();
+                    break;
+            }
         }
 
         /// <summary>
@@ -225,10 +351,355 @@ namespace LlamaApp
         internal Llama.RuntimeUpdateScheduler RuntimeUpdates => _runtimeUpdates!;
 
         /// <summary>
+        /// The first .gguf among a file activation's files (an "Open With"
+        /// activation may carry several), or null. Works for the cold-start
+        /// activation (<see cref="LlamaApp.OnLaunched"/>) and for the ones
+        /// redirected from a second instance (AppInstance.Activated).
+        /// </summary>
+        private static string? FirstGgufFromFileActivation(object? activationData)
+        {
+            if (activationData is Windows.ApplicationModel.Activation.FileActivatedEventArgs fileArgs)
+            {
+                foreach (var file in fileArgs.Files)
+                    if (Common.GgufFile.IsGguf(file.Path))
+                        return file.Path;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Distills this process's activation into a handoff request: a share
+        /// activation's payload (shared text, a .gguf, or an image), an
+        /// "Open With" .gguf, or nothing.
+        ///
+        /// <para>A share's <c>DataPackageView</c> cannot cross a process
+        /// boundary, so the extraction happens in the process that received
+        /// the activation — the cold-start instance (which keeps the distilled
+        /// request and handles it after startup) or a second instance (which
+        /// writes it to the handoff file and exits). Per the ShareOperation
+        /// contract, the process that received the activation ALWAYS reports
+        /// it — ReportStarted around the extraction, ReportCompleted after,
+        /// ReportError on failure. Exiting with an unreported operation leaves
+        /// the in-process share host in a bad state and failed fast in
+        /// practice (0xC0000409 from the native share machinery).</para>
+        /// </summary>
+        private static async Task<Common.HandoffRequest> ExtractHandoffFromActivationAsync(
+            Microsoft.Windows.AppLifecycle.AppActivationArguments activatedArgs)
+        {
+            try
+            {
+                var data = activatedArgs.Data;
+
+                // "Open With": a file activation carries the path directly.
+                if (FirstGgufFromFileActivation(data) is { } gguf)
+                    return Common.HandoffRequest.ForModel(gguf);
+
+                // A Windows share: text, or files (.gguf imports).
+                if (data is Windows.ApplicationModel.Activation.ShareTargetActivatedEventArgs share)
+                {
+                    var operation = share.ShareOperation;
+                    operation.ReportStarted();
+                    try
+                    {
+                        return await ExtractSharePayloadAsync(operation);
+                    }
+                    catch (Exception ex)
+                    {
+                        Common.Log.Warn(ex, "share payload extraction failed; reporting the share as failed");
+                        try { operation.ReportError("Llama could not read the shared content."); } catch { /* best-effort */ }
+                        return Common.HandoffRequest.None;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Common.Log.Warn(ex, "share activation extraction failed");
+            }
+            return Common.HandoffRequest.None;
+        }
+
+        /// <summary>The payload of a reported share: text, a model file, an image
+        /// file, or a re-encoded raw bitmap. Assumes ReportStarted was already
+        /// called and the caller reports Completed/Error.</summary>
+        private static async Task<Common.HandoffRequest> ExtractSharePayloadAsync(
+            Windows.ApplicationModel.DataTransfer.ShareTarget.ShareOperation operation)
+        {
+            var package = operation.Data;
+            if (package.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.Text))
+            {
+                var text = await package.GetTextAsync();
+                operation.ReportCompleted();
+                return text.Length > 0
+                    ? Common.HandoffRequest.ForText(text)
+                    : Common.HandoffRequest.None;
+            }
+
+            if (package.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.StorageItems))
+            {
+                var items = await package.GetStorageItemsAsync();
+                var paths = items.Select(item => item.Path).Where(p => p is not null).Cast<string>().ToList();
+
+                // A shared .gguf is a model to load — the same pipeline
+                // as Open With.
+                var model = paths.FirstOrDefault(Common.GgufFile.IsGguf);
+                if (model is not null)
+                {
+                    operation.ReportCompleted();
+                    return Common.HandoffRequest.ForModel(model);
+                }
+
+                // Otherwise an image (.jpg/.jpeg/.png) attaches to the
+                // chat.
+                var image = paths.FirstOrDefault(Common.SharedImage.IsImagePath);
+                operation.ReportCompleted();
+                return image is not null
+                    ? Common.HandoffRequest.ForImage(image)
+                    : Common.HandoffRequest.None;
+            }
+
+            // A Bitmap share (e.g. a screenshot tool that hands over
+            // pixels, not a file) is re-encoded as PNG into the app's
+            // scratch dir — the WebUI paste takes a file's bytes.
+            if (package.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.Bitmap))
+            {
+                var reference = await package.GetBitmapAsync();
+                string? imagePath = null;
+                try
+                {
+                    using var stream = await reference.OpenReadAsync();
+                    imagePath = await SaveSharedBitmapAsync(stream);
+                }
+                catch (Exception ex)
+                {
+                    Common.Log.Warn(ex, "decoding the shared bitmap failed");
+                }
+                operation.ReportCompleted();
+                return imagePath is not null
+                    ? Common.HandoffRequest.ForImage(imagePath)
+                    : Common.HandoffRequest.None;
+            }
+
+            operation.ReportCompleted();
+            return Common.HandoffRequest.None;
+        }
+
+        /// <summary>
+        /// Shared text lands in the chat overlay: the overlay opens (Summon)
+        /// and the text is handed to it as a pending prompt, which the overlay
+        /// injects into the WebUI's composer as soon as one exists (a share
+        /// that arrives before any model is loaded waits until the chat
+        /// screen is up — see OverlayWindow.SetPendingPrompt).
+        /// </summary>
+        private async Task HandleSharedPromptAsync(string prompt)
+        {
+            try
+            {
+                Common.Log.Info($"shared text received ({prompt.Length} chars); opening the chat overlay");
+                _overlay?.Summon(ShareSummonGraceMs);
+                _overlay?.SetPendingPrompt(prompt);
+            }
+            catch (Exception ex)
+            {
+                Common.Log.Warn(ex, "handling the shared prompt failed");
+            }
+            await Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// A programmatic overlay summon ignores focus loss for this long: the
+        /// dismissing share sheet races the summon for focus and can
+        /// activate-then-deactivate the overlay repeatedly, which used to flash
+        /// it shut before the user ever saw it. Long enough to outlast the sheet's
+        /// teardown; short enough that click-away still dismisses normally after.
+        /// </summary>
+        private const int ShareSummonGraceMs = 3000;
+
+        /// <summary>
+        /// A shared image attaches to the chat overlay: the overlay opens and
+        /// the image is queued as a pending attachment (a synthetic paste
+        /// into the WebUI's composer, gated on an image-capable model — see
+        /// <see cref="OverlayWindow.SetPendingImage"/>). When no image-capable
+        /// model is loaded, one is loaded for the share — the user's intent is
+        /// "ask about this image", which needs vision — preferring models the
+        /// user has used before (a saved context length), smallest first; the
+        /// overlay's retry loop pastes once the model is resident.
+        /// </summary>
+        private async Task HandleSharedImageAsync(string imagePath)
+        {
+            try
+            {
+                Common.Log.Info($"shared image received '{System.IO.Path.GetFileName(imagePath)}'; opening the chat overlay");
+                _overlay?.Summon(ShareSummonGraceMs);
+                _overlay?.SetPendingImage(imagePath);
+                _ = EnsureVisionModelForShareAsync();
+            }
+            catch (Exception ex)
+            {
+                Common.Log.Warn(ex, "handling the shared image failed");
+            }
+            await Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Loads an image-capable model for an incoming shared image when no
+        /// suitable model is loaded: prefer the loaded model when it already
+        /// accepts images, else prefer models the user has configured a context
+        /// length for (a trace of prior use), smallest on-disk model first so
+        /// the pick fits the GPU and loads fast. Fire-and-forget — the overlay's
+        /// paste retry loop delivers once the model is resident.
+        /// </summary>
+        private async Task EnsureVisionModelForShareAsync()
+        {
+            try
+            {
+                var snapshot = Llama.LlamaManager.Shared.LastModelsSnapshot;
+                if (snapshot.FirstOrDefault(m => m.IsLoaded && m.SupportsImage) is not null)
+                    return; // already usable — the retry loop will paste
+
+                var candidates = snapshot
+                    .Where(m => m.SupportsImage && !m.IsLoading && !m.IsDownloading)
+                    .ToList();
+                if (candidates.Count == 0)
+                {
+                    Common.Log.Warn("no image-capable model is available for the shared image; " +
+                        "the overlay will wait for the user to load one");
+                    return; // the wait-and-notify path remains
+                }
+
+                var preferred = candidates
+                    .Where(m => Settings.Current.ModelContextLengths.ContainsKey(m.Id))
+                    .ToList();
+                var pool = preferred.Count > 0 ? preferred : candidates;
+                var choice = pool
+                    .OrderBy(m => System.IO.File.Exists(m.Path) ? new System.IO.FileInfo(m.Path).Length : long.MaxValue)
+                    .First();
+
+                Common.Log.Info($"loading image-capable model '{choice.Id}' for the shared image");
+                var item = new Views.ModelItem { Name = choice.Id, RepoName = choice.Id };
+                if (!await Llama.LlamaManager.Shared.LoadModelAsync(item))
+                    Common.Log.Warn($"the server declined to load '{choice.Id}' for the shared image");
+                // Loaded or not: the overlay's retry loop decides delivery, and
+                // the poller refreshes LoadedModelSupportsImages within ~1s.
+            }
+            catch (Exception ex)
+            {
+                Common.Log.Warn(ex, "auto-loading a vision model for the share failed");
+            }
+        }
+
+        /// <summary>
+        /// Re-encodes a shared <see cref="Windows.ApplicationModel.DataTransfer.StandardDataFormats.Bitmap"/>
+        /// stream as PNG into the app's scratch dir
+        /// (<c>%LOCALAPPDATA%\Llama\shared</c>, swept on delivery). Returns the
+        /// written path, or null when the pixels couldn't be decoded (some
+        /// sources share raw DIB data the decoder can't read).
+        /// </summary>
+        private static async Task<string?> SaveSharedBitmapAsync(
+            Windows.Storage.Streams.IRandomAccessStream stream)
+        {
+            var dir = Views.OverlayWindow.ScratchImageDir;
+            Directory.CreateDirectory(dir);
+            var path = System.IO.Path.Combine(dir, $"shared-{Guid.NewGuid():N}.png");
+
+            var decoder = await Windows.Graphics.Imaging.BitmapDecoder.CreateAsync(stream);
+            using var softwareBitmap = await decoder.GetSoftwareBitmapAsync();
+
+            using var fileStream = File.Open(path, FileMode.CreateNew);
+            using var winrtStream = fileStream.AsRandomAccessStream();
+            var encoder = await Windows.Graphics.Imaging.BitmapEncoder.CreateAsync(
+                Windows.Graphics.Imaging.BitmapEncoder.PngEncoderId, winrtStream);
+            encoder.SetSoftwareBitmap(softwareBitmap);
+            await encoder.FlushAsync();
+
+            return path;
+        }
+
+        /// <summary>
+        /// An unpackaged <c>LlamaApp.exe C:\path\model.gguf</c> launch (dev
+        /// runs, scripts) carries the path on the command line — WinUI 3's
+        /// LaunchActivatedEventArgs.Arguments is empty there, so argv is read
+        /// directly. Quotes are tolerated; a non-existing file is ignored
+        /// (the arguments are free-form).
+        /// </summary>
+        private static string? FirstGgufOnCommandLine()
+        {
+            var argv = Environment.GetCommandLineArgs();
+            for (var i = 1; i < argv.Length; i++)
+            {
+                var candidate = argv[i].Trim().Trim('"');
+                if (Common.GgufFile.IsGguf(candidate) && File.Exists(candidate))
+                    return candidate;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Handles "Open With → Llama" on a .gguf: shows the flyout, ensures
+        /// the llama server is up, links the file into the server's
+        /// <c>--models-dir</c> (where the router discovers it as a model named
+        /// after the file), refreshes the model list so the router registers
+        /// the import, and loads it. On success the chat overlay opens on the
+        /// model; failures surface as toasts with actionable text.
+        /// </summary>
+        private async Task OpenModelFileAsync(string modelPath)
+        {
+            var fileName = System.IO.Path.GetFileName(modelPath);
+            try
+            {
+                // Something visibly happens immediately (loads take a while).
+                _trayIcon?.ShowFlyout();
+
+                // The server may need installing/starting (first ever use can
+                // be triggered by opening a model file).
+                var reachable = await Llama.LlamaManager.Shared.EnsureLlamaOrDownloadAsync();
+                if (!reachable)
+                {
+                    Notifications.Show($"Couldn't open {fileName}",
+                        "The llama server isn't running. Open the Llama flyout and check the server status, then try again.");
+                    return;
+                }
+
+                var import = Llama.LlamaManager.ImportLocalModel(modelPath);
+                if (import.Outcome == Llama.LocalModelImportOutcome.Copied)
+                    Notifications.Show($"Copying {fileName}",
+                        "The file lives on another drive, so it was copied into Llama's models folder — the model loads next.");
+
+                // The router rescans its model sources when asked (older
+                // servers only on GET /models?reload=1) — the refresh registers
+                // the import, making its id loadable (a load without it would
+                // answer 404 model-is-not-found).
+                await Llama.LlamaManager.Shared.RefreshModelsAsync();
+
+                // ServerModelId of a file-imported model is its id (no
+                // repo:quant shape — see LocalModelImport.DeriveModelId).
+                var model = new Views.ModelItem { Name = import.ModelId, RepoName = import.ModelId };
+                var loaded = await Llama.LlamaManager.Shared.LoadModelAsync(model);
+                if (loaded)
+                {
+                    Common.Log.Info($"opened model file '{modelPath}' as '{import.ModelId}'");
+                    SummonChatOverlay();
+                }
+                else
+                {
+                    Common.Log.Warn($"open-with: the server rejected model '{import.ModelId}' ({modelPath})");
+                    Notifications.Show($"Couldn't load {fileName}",
+                        "The llama server rejected the model. It may be an unsupported or damaged GGUF file.");
+                }
+            }
+            catch (Exception ex)
+            {
+                // The importer throws actionable IOExceptions (file missing,
+                // no space for a cross-volume copy) — the message is the toast.
+                Common.Log.Error(ex, $"open-with of '{modelPath}' failed");
+                Notifications.Show($"Couldn't open {fileName}", ex.Message);
+            }
+        }
+
+        /// <summary>
         /// Opens the chat overlay — the Alt+Space panel — from surfaces that
         /// don't own the hotkey (toast Chat button, tray context menu).
         /// </summary>
-        internal void SummonChatOverlay() => _overlay?.Summon();
+        internal void SummonChatOverlay() => _overlay?.Summon(ShareSummonGraceMs);
 
         /// <summary>
         /// Responds to a toast activation on the UI thread: a body click keeps
