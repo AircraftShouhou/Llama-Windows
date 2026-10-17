@@ -240,6 +240,10 @@ namespace LlamaApp
             // the user picks a context length, and the manager renders it into
             // the server's --models-preset INI (see ReloadModelPresetsAsync).
             Llama.LlamaManager.Shared.ModelContextLengths = Settings.Current.ModelContextLengths;
+            // Draft-head detection shares the same INI channel: spec-type
+            // entries (draft-dflash/…) detected from Hub repo listings ride
+            // beside the context lengths (see DraftHeadDetection).
+            Llama.LlamaManager.Shared.ModelSpeculativeTypes = Settings.Current.ModelSpeculativeTypes;
             Common.Log.Info($"cache directory: {Settings.Current.CacheDirectory}");
             // Presence only — never log the token itself.
             Common.Log.Info($"HF token: {(string.IsNullOrWhiteSpace(Settings.Current.HuggingFaceToken) ? "not set" : "configured")}");
@@ -313,6 +317,13 @@ namespace LlamaApp
                         ? Common.HandoffRequest.ForModelId(openModelId)
                         : Common.InstanceHandoff.TryConsume()));
             DispatchHandoff(startupRequest);
+
+            // Speculative-decoding draft heads (issue #97): watch the server's
+            // model list — any model that appears unchecked (downloaded from
+            // the app, from the WebUI in a browser, cached before the feature,
+            // or adopted with the server) is detected within a poll cycle.
+            // Fire-and-forget: the watcher owns its own threading.
+            DraftHeadDetection.StartWatching();
         }
 
         /// <summary>
@@ -743,6 +754,20 @@ namespace LlamaApp
                 // answer 404 model-is-not-found).
                 await Llama.LlamaManager.Shared.RefreshModelsAsync();
 
+                // Embedded MTP head (issue #97): builds that bake the head
+                // into the main weights tag their filename with an mtp token
+                // (…-Q4_K_M-mtp.gguf). The server's models-dir scan wires
+                // sidecar files by itself, but not embedded heads — the
+                // spec-type entry for those comes from the app. Best-effort.
+                if (Common.DraftHeads.HasEmbeddedMtp(fileName))
+                {
+                    Settings.Current.ModelSpeculativeTypes[import.ModelId] =
+                        Common.DraftHeads.SpecType(Common.DraftHeadKind.Mtp);
+                    Settings.Current.Save();
+                    await Llama.LlamaManager.Shared.ReloadModelPresetsAsync();
+                    Common.Log.Info($"draft heads: '{fileName}' carries an embedded MTP head — speculative decoding enabled");
+                }
+
                 // ServerModelId of a file-imported model is its id (no
                 // repo:quant shape — see LocalModelImport.DeriveModelId).
                 var model = new Views.ModelItem { Name = import.ModelId, RepoName = import.ModelId };
@@ -798,6 +823,13 @@ namespace LlamaApp
                         return;
                     case "cancelDownload":
                         _window?.CancelDownloadFromToast(id);
+                        return;
+                    case "reloadDraftHead":
+                        // A draft head was detected on a loaded model (issue
+                        // #97); the reload respawns the child with its
+                        // spec-type so the head engages now.
+                        if (!string.IsNullOrWhiteSpace(id))
+                            _ = DraftHeadDetection.ReloadForDraftHeadsAsync(id);
                         return;
                 }
             }

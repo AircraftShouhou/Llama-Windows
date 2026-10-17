@@ -1058,6 +1058,15 @@ namespace LlamaApp.Views
 
             try
             {
+                // Draft heads (issue #97): detect the repo's speculative-decoding
+                // sidecars while the download streams — the Hub query runs in
+                // parallel and must never delay or fault the download. The
+                // result is applied only when the download succeeds: an entry
+                // for a model that never landed would list a ghost model the
+                // router can't load (an INI section with no files behind it).
+                var modelId = ((Common.IModel)item).ServerModelId;
+                var draftHeads = DraftHeadDetection.DetectAsync(modelId);
+
                 var ok = await mgr.DownloadModelAsync(item, progress, cts.Token);
                 void Complete()
                 {
@@ -1073,10 +1082,13 @@ namespace LlamaApp.Views
                         // re-download must not remove it.
                         item.PendingFirstDownload = false;
                         // Load it. The row now shows the load ring until the
-                        // poller reports the model as loaded.
+                        // poller reports the model as loaded. The draft heads
+                        // are applied first (persisted + presets reloaded) so
+                        // THIS first load drafts with the head when the repo
+                        // ships one.
                         item.LoadFailed = false;
                         item.IsLoading = true;
-                        _ = LoadAndWatchAsync(item);
+                        _ = LoadAndWatchWithDraftHeadsAsync(item, modelId, draftHeads);
                     }
                     else
                     {
@@ -1515,6 +1527,19 @@ namespace LlamaApp.Views
                 _localByServerId.Remove(((IModel)item).ServerModelId);
                 LocalModels.Remove(item);
                 UpdateEmptyState();
+
+                // The model's settings entries must not outlive it: they render
+                // into the --models-preset INI the router now ALWAYS launches
+                // with, and a section for a deleted model would re-list it as a
+                // loadable ghost. (Lingered as a latent issue for context
+                // lengths while the flag was conditional — pruned here now.)
+                var removed = Settings.Current.ModelContextLengths.Remove(((IModel)item).ServerModelId);
+                removed |= Settings.Current.ModelSpeculativeTypes.Remove(((IModel)item).ServerModelId);
+                if (removed)
+                {
+                    Settings.Current.Save();
+                    _ = LlamaManager.Shared.ReloadModelPresetsAsync();
+                }
                 return true;
             }
 
@@ -1937,6 +1962,22 @@ namespace LlamaApp.Views
         /// transition (setting <see cref="ModelItem.IsLoaded"/> and clearing
         /// <see cref="ModelItem.IsLoading"/> via <see cref="ReconcileAsync"/>).
         /// </summary>
+        /// <summary>
+        /// <see cref="LoadAndWatchAsync"/>, preceded by the draft-head
+        /// application (issue #97): persists the detection that ran during the
+        /// download and reloads the server's model presets, so this first
+        /// load fetches and wires the repo's speculative-decoding sidecar. In
+        /// the common case the detection finished long before the download,
+        /// so the apply is a settings write + a preset reload — but even a
+        /// slow one only delays the load, never skips it.
+        /// </summary>
+        private async Task LoadAndWatchWithDraftHeadsAsync(
+            ModelItem item, string modelId, Task<string?> draftHeads)
+        {
+            await DraftHeadDetection.ApplyDetectedAsync(modelId, draftHeads);
+            await LoadAndWatchAsync(item);
+        }
+
         private async Task LoadAndWatchAsync(ModelItem item)
         {
             var mgr = LlamaManager.Shared;
