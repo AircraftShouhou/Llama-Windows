@@ -1490,6 +1490,23 @@ public sealed class LlamaManager
             : [];
         if (enrolled.Count > 0)
             Log.Info($"model folders: enrolled {enrolled.Count} model(s) from disk");
+        // Keep the scan's id → path map: the rows' "reveal in Explorer"
+        // resolves enrolled models through it (the server's /models does not
+        // reliably report a path). Reference-swapped for readers.
+        _enrolledModelPaths = enrolled.ToDictionary(
+            m => m.Name, m => m.ModelPath, StringComparer.OrdinalIgnoreCase);
+
+        // Don't render preset sections for models whose files no longer exist:
+        // a ctx / spec-type entry outlives its model (deleted in Explorer, a
+        // folder un-enrolled while the app was off) and the router re-lists a
+        // preset section as a loadable ghost — a row that can't even be
+        // deleted, because there is nothing on disk left to delete.
+        var listed = LastModelsSnapshot;
+        bool IsBusy(string id) =>
+            listed.Any(m => m.Id == id && (m.IsDownloading || m.IsLoading));
+        bool Exists(string id) => FindModelFilePath(id) is not null;
+        contextItems = FilterExistingModels(contextItems, IsBusy, Exists);
+        specItems = FilterExistingModels(specItems, IsBusy, Exists);
 
         try
         {
@@ -2754,6 +2771,85 @@ public sealed class LlamaManager
     /// trip; may be empty or one poll cycle stale.
     /// </summary>
     public IReadOnlyList<ServerModel> LastModelsSnapshot => _lastModelsSnapshot;
+
+    /// <summary>Enrolled-folder scan's id → file map (the last
+    /// <c>WriteContextPresetsIniAsync</c> run). See
+    /// <see cref="FindModelFilePath(string)"/>.</summary>
+    private volatile IReadOnlyDictionary<string, string> _enrolledModelPaths =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Best-effort "where is this model's file on disk" for the rows' reveal
+    /// action. The server's <c>/models</c> <c>path</c> is not reliably
+    /// populated, so this resolves locally, in order: the enrolled-folder scan
+    /// map (that scan already walked the trees — and covers stem ids and
+    /// shards the cache layouts don't), the cache/managed flat layouts
+    /// <see cref="ModelFileLocator"/> probes, and the managed models dir's
+    /// direct <c>{id}.gguf</c> (Open-With imports). Null when nothing on disk
+    /// matches — the row then simply hides its reveal button.
+    /// </summary>
+    public string? FindModelFilePath(string serverModelId)
+        => FindModelFilePath(
+            serverModelId, _enrolledModelPaths,
+            ModelFileLocator.DefaultCacheRoots(), ManagedModelsDir);
+
+    /// <summary>
+    /// <see cref="FindModelFilePath(string)"/> with its sources injectable —
+    /// internal so tests can drive it against temp directories. Ids come from
+    /// remote payloads, so every disk probe is containment-checked.
+    /// </summary>
+    internal static string? FindModelFilePath(
+        string serverModelId,
+        IReadOnlyDictionary<string, string> enrolledPaths,
+        IReadOnlyList<string> cacheRoots,
+        string managedDir)
+    {
+        if (string.IsNullOrWhiteSpace(serverModelId)) return null;
+
+        // 1. Enrolled folders: the scanner's own id (stem) → path map.
+        if (enrolledPaths.TryGetValue(serverModelId, out var enrolledPath) &&
+            File.Exists(enrolledPath))
+            return enrolledPath;
+
+        // 2. HF-cache / managed flat layouts (owner/repo:quant ids).
+        if (ModelFileLocator.TryFind(serverModelId, cacheRoots) is { PrimaryFilePath: { } located })
+            return located;
+
+        // 3. Open-With imports land as {id}.gguf in the managed models dir.
+        if (ModelFileLocator.IsSafeModelId(serverModelId))
+        {
+            var direct = Path.Combine(managedDir, serverModelId + ".gguf");
+            if (ModelFileLocator.IsUnder(managedDir, direct) && File.Exists(direct))
+                return direct;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Drops preset entries for models whose files no longer exist (the ghost
+    /// guard behind <c>WriteContextPresetsIniAsync</c>), keeping entries for
+    /// models that are merely busy (mid-download / mid-load — no file yet) or
+    /// whose file exists. Deliberately non-destructive: the settings entries
+    /// themselves are untouched, so a temporarily unavailable folder (an
+    /// asleep network share) gets its preferences back when the file does.
+    /// Internal for tests.
+    /// </summary>
+    internal static List<KeyValuePair<string, int>> FilterExistingModels(
+        IEnumerable<KeyValuePair<string, int>> entries,
+        Func<string, bool> isBusy,
+        Func<string, bool> fileExists)
+        => entries.Where(kv => isBusy(kv.Key) || fileExists(kv.Key)).ToList();
+
+    /// <summary>
+    /// The speculative-type counterpart of the context-length filter — same
+    /// ghost guard.
+    /// </summary>
+    internal static List<KeyValuePair<string, string>> FilterExistingModels(
+        IEnumerable<KeyValuePair<string, string>> entries,
+        Func<string, bool> isBusy,
+        Func<string, bool> fileExists)
+        => entries.Where(kv => isBusy(kv.Key) || fileExists(kv.Key)).ToList();
 
     /// <summary>
     /// Streams an OpenAI-compatible chat completion for <paramref name="userMessage"/>

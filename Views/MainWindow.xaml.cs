@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Drawing;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -104,6 +105,11 @@ namespace LlamaApp.Views
         // across unrelated rebuilds, so the ListView's realized containers
         // (and scroll position) survive membership churn.
         private readonly Dictionary<ModelItem, InstalledModelListItemViewModel> _installedWrappers = new();
+
+        // Hysteresis for rows whose model vanished from the server's list
+        // (file deleted outside the app) — see the vanish sweep in
+        // ReconcileAsync.
+        private readonly MissingSnapshotTracker _missingSnapshot = new();
 
         /// <summary>
         /// The remote catalog, fetched once as model families and shared by
@@ -485,6 +491,9 @@ namespace LlamaApp.Views
                 Logo = ModelItem.ResolveLogoOrGeneric(brand),
                 IsLoaded = sm.IsLoaded,
                 IsDownloading = sm.IsDownloading,
+                // The server's path is not reliably populated — resolve
+                // locally when it isn't (enrolled scan map / cache layouts).
+                FilePath = sm.Path ?? LlamaManager.Shared.FindModelFilePath(sm.Id),
             };
         }
 
@@ -1549,6 +1558,29 @@ namespace LlamaApp.Views
         /// <see cref="LocalModelDeleteConfirm_Click"/> can act on them. Deleting
         /// means re-downloading GBs, so it never happens on a single misclick.
         /// </summary>
+        /// <summary>
+        /// "Show model file in Explorer": opens the model's containing folder
+        /// with the .gguf selected (falls back to the folder alone when the
+        /// file is gone). The launch decision and explorer.exe arguments live
+        /// in <see cref="ExplorerReveal"/> (pure + tested).
+        /// </summary>
+        private void LocalModelRevealInExplorer_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not Button { Tag: ModelItem item }) return;
+            var reveal = ExplorerReveal.BuildReveal(item.FilePath);
+            if (reveal is null) return;
+            try
+            {
+                var (fileName, arguments) = reveal.Value;
+                Process.Start(new ProcessStartInfo(fileName)
+                {
+                    Arguments = arguments,
+                    UseShellExecute = true,
+                });
+            }
+            catch (Exception ex) { Log.Warn(ex, "could not reveal the model file in Explorer"); }
+        }
+
         private void LocalModelDelete_Click(object sender, RoutedEventArgs e)
         {
             if (sender is not Button btn) return;
@@ -1608,21 +1640,32 @@ namespace LlamaApp.Views
                 // with, and a section for a deleted model would re-list it as a
                 // loadable ghost. (Lingered as a latent issue for context
                 // lengths while the flag was conditional — pruned here now.)
-                var modelId = ((IModel)item).ServerModelId;
-                // Mutations under each dictionary's lock — the same shared
-                // settings dictionaries the draft-head poller and the INI
-                // renderer touch from background threads (see
-                // DraftHeadDetection.Apply's lock note).
-                var contexts = Settings.Current.ModelContextLengths;
-                bool removed;
-                lock (contexts) removed = contexts.Remove(modelId);
-                var specTypes = Settings.Current.ModelSpeculativeTypes;
-                lock (specTypes) removed |= specTypes.Remove(modelId);
-                if (removed)
+                if (PruneModelSettings(((IModel)item).ServerModelId))
                 {
                     Settings.Current.Save();
                     _ = LlamaManager.Shared.ReloadModelPresetsAsync();
                 }
+                return true;
+            }
+
+            // The server said no. If the file is already gone (deleted in
+            // Explorer, a folder un-enrolled while the app was off) there is
+            // nothing for the server to delete — the row is a ghost kept
+            // alive by its settings entries' preset section. Clean it up and
+            // reload the presets so the router drops it. A model that still
+            // exists (a transient refusal) simply reappears from the next
+            // snapshot.
+            var serverModelId = ((IModel)item).ServerModelId;
+            if (item.DownloadCancellation is null && !item.IsDownloading &&
+                LlamaManager.Shared.FindModelFilePath(serverModelId) is null)
+            {
+                Log.Info("model file already gone; removing the ghost row: " + serverModelId);
+                _localByServerId.Remove(serverModelId);
+                LocalModels.Remove(item);
+                UpdateEmptyState();
+                if (PruneModelSettings(serverModelId))
+                    Settings.Current.Save();
+                _ = LlamaManager.Shared.ReloadModelPresetsAsync();
                 return true;
             }
 
@@ -2479,6 +2522,14 @@ namespace LlamaApp.Views
 
                 if (item is not null)
                 {
+                    // Rows built before the file existed (an app-driven
+                    // download) learn their on-disk path here — it drives the
+                    // row's "reveal in Explorer" button. Resolution retries on
+                    // every reconcile until it succeeds (the enrolled-folder
+                    // scan map may fill in after the row was built).
+                    if (item.FilePath is null)
+                        item.FilePath = sm.Path ?? LlamaManager.Shared.FindModelFilePath(sm.Id);
+
                     // Server truth: any state but "downloading" means the model
                     // exists in the cache — no longer a pending first download.
                     if (!sm.IsDownloading)
@@ -2640,7 +2691,68 @@ namespace LlamaApp.Views
                 }
             }
 
+            // Rows whose model is gone: either vanished from the server's
+            // list entirely (a file deleted outside the app leaves the
+            // server's scan without it after the next preset reload), or
+            // still listed but no longer on disk (a ghost the preset kept
+            // listed). Both leave the row with a play button that can only
+            // fail — so both expire it. Hysteresis (MissingSnapshotTracker):
+            // the model must be gone from several consecutive snapshots — one
+            // missed listing (a rescan in flight, a briefly unreachable
+            // network folder) never flickers rows away. Never runs on empty
+            // snapshots (those are transient errors — see above) and never
+            // for in-flight downloads their drivers own (the sweep above
+            // owns the poller's).
+            if (serverIds.Count > 0)
+            {
+                // A row's model counts as present only when it is busy
+                // (downloading / loading / loaded — see ModelPresence for why
+                // each must stay) or its file is findable on disk. The
+                // server-reported path wins when given; local resolution
+                // (enrolled scan map / cache layouts) is the fallback.
+                bool IsBusy(string id) => serverModels.Any(m =>
+                    m.Id == id && (m.IsDownloading || m.IsLoading || m.IsLoaded));
+                bool FileOnDisk(string id)
+                {
+                    var sm = serverModels.FirstOrDefault(m => m.Id == id);
+                    return (sm?.Path is { } reported && System.IO.File.Exists(reported))
+                        || LlamaManager.Shared.FindModelFilePath(id) is not null;
+                }
+
+                var present = ModelPresence.EffectivelyPresent(serverIds, IsBusy, FileOnDisk);
+                var rowIds = _localByServerId
+                    .Where(kv => kv.Value.DownloadCancellation is null && !kv.Value.IsDownloading)
+                    .Select(kv => kv.Key)
+                    .ToList();
+                foreach (var id in _missingSnapshot.Observe(rowIds, present))
+                {
+                    if (!_localByServerId.TryGetValue(id, out var row)) continue;
+                    Log.Info("model row expired (gone from disk or unlisted): " + id);
+                    _localByServerId.Remove(id);
+                    LocalModels.Remove(row);
+                    if (PruneModelSettings(id))
+                        Settings.Current.Save();
+                }
+            }
+
             UpdateEmptyState();
+        }
+
+        /// <summary>
+        /// Removes a model's per-model settings entries (context length /
+        /// speculative type) so the --models-preset INI can't grow ghost
+        /// sections for ids no scan produces anymore. Mutations take the
+        /// dictionaries' locks (see DraftHeadDetection.Apply). Shared by the
+        /// delete path and the vanished-row sweep.
+        /// </summary>
+        private static bool PruneModelSettings(string serverModelId)
+        {
+            var contexts = Settings.Current.ModelContextLengths;
+            bool removed;
+            lock (contexts) removed = contexts.Remove(serverModelId);
+            var specTypes = Settings.Current.ModelSpeculativeTypes;
+            lock (specTypes) removed |= specTypes.Remove(serverModelId);
+            return removed;
         }
 
         /// <summary>
@@ -3514,6 +3626,12 @@ namespace LlamaApp.Views
             else
             {
                 _allowHideOnDeactivate = true;
+                // Flyout is opening: refresh the model folders' view of disk
+                // (rate-limited) — the safety net for folders whose filesystem
+                // watcher died quietly (e.g. network shares) and for changes
+                // the watcher filtered out. The /models poller reconciles the
+                // result into the rows.
+                EnrolledFolderWatch.RefreshOnOpen();
             }
         }
 
