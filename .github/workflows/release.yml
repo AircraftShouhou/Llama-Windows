@@ -216,7 +216,7 @@ jobs:
         env:
           PARTNER_CENTER_APP_ID: ${{ secrets.PARTNER_CENTER_APP_ID }}
         run: |
-          $extra = if ('${{ vars.STORE_NO_COMMIT }}' -eq 'true') { '--noCommit' } else { '' }
+          $extra = if ('${{ vars.STORE_NO_COMMIT }}' -ne 'false') { '--noCommit' } else { '' }
           $bundle = Get-ChildItem store -Filter *.msixbundle | Select-Object -First 1
           if (-not $bundle) { throw 'signed .msixbundle artifact not found in store/' }
           msstore publish $bundle.FullName --appId $env:PARTNER_CENTER_APP_ID $extra
